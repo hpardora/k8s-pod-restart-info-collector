@@ -38,8 +38,8 @@ func main() {
 		klog.Fatal(err)
 	}
 
-	slack := NewSlack()
-	controller := NewController(clientset, slack)
+	notifier := GetNotifier()
+	controller := NewController(clientset, notifier)
 
 	// Start the controller
 	stop := make(chan struct{})

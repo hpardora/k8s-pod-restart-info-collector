@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -23,19 +25,22 @@ import (
 )
 
 const (
-	SlackChannelKey = "alert-slack-channel"
+	ChannelKey = "alert-notifier-channel"
 )
 
 type Controller struct {
 	clientset       kubernetes.Interface
-	slack           Slack
+	notifier        Notifier
 	informerFactory informers.SharedInformerFactory
 	podInformer     coreinformers.PodInformer
 	queue           workqueue.RateLimitingInterface
+	history         map[string]time.Time
+	clusterName     string
+	muteSeconds     int
 }
 
 // NewController creates a new Controller.
-func NewController(clientset kubernetes.Interface, slack Slack) *Controller {
+func NewController(clientset kubernetes.Interface, notifier Notifier) *Controller {
 	const resyncPeriod = 0
 	ignoreRestartCount := getIgnoreRestartCount()
 
@@ -80,12 +85,24 @@ func NewController(clientset kubernetes.Interface, slack Slack) *Controller {
 		},
 	})
 
+	if clusterName := os.Getenv("CLUSTER_NAME"); clusterName == "" {
+		clusterName = "cluster-name"
+		klog.Warningf("Environment variable CLUSTER_NAME is not set, default: %s\n", clusterName)
+	}
+
+	muteSeconds, err := strconv.Atoi(os.Getenv("MUTE_SECONDS"))
+	if err != nil {
+		muteSeconds = 600
+		klog.Warningf("Environment variable MUTE_SECONDS is not set, default: %d\n", muteSeconds)
+	}
+
 	return &Controller{
 		clientset:       clientset,
 		informerFactory: informerFactory,
 		podInformer:     podInformer,
 		queue:           queue,
-		slack:           slack,
+		notifier:        notifier,
+		history:         make(map[string]time.Time),
 	}
 }
 
@@ -197,14 +214,14 @@ func (c *Controller) getPodFromIndexer(key string) (*v1.Pod, error) {
 	return pod, nil
 }
 
-// handlePod collects and sends related info to slack.
+// handlePod collects and sends related info to notifier.
 func (c *Controller) handlePod(pod *v1.Pod) error {
-	// Skip if pod in slack.History
+	// Skip if pod in notifier.History
 	podKey := pod.Namespace + "/" + pod.Name
 
 	currentTime := time.Now().Local()
-	if lastSentTime, ok := c.slack.History[podKey]; ok {
-		if int(currentTime.Sub(lastSentTime).Seconds()) < c.slack.MuteSeconds {
+	if lastSentTime, ok := c.history[podKey]; ok {
+		if int(currentTime.Sub(lastSentTime).Seconds()) < c.muteSeconds {
 			klog.Infof("Skip: %s, already sent %s ago.\n", podKey, duration.HumanDuration(time.Since(lastSentTime)))
 			return nil
 		}
@@ -253,28 +270,23 @@ func (c *Controller) handlePod(pod *v1.Pod) error {
 		if containerLogs == "" {
 			containerLogs = "• No Logs Before Restart\n"
 		} else {
-			// Slack attachment text will be truncated when > 8000 chars
-			maxLogLength := 7500 - len(podStatus+podEvents+nodeEvents)
-			if maxLogLength > 0 && len(containerLogs) > maxLogLength {
-				containerLogs = containerLogs[len(containerLogs)-maxLogLength:]
-			}
 			containerLogs = fmt.Sprintf("• Pod Logs Before Restart\n```\n%s```\n", containerLogs)
 		}
 
-		msg := SlackMessage{
-			Title:  fmt.Sprintf("Pod restarted!\ncluster: %s, pod: %s, namespace: %s", c.slack.ClusterName, pod.Name, pod.Namespace),
-			Footer: fmt.Sprintf("%s, %s, %s", c.slack.ClusterName, pod.Name, pod.Namespace),
+		msg := Message{
+			Title:  fmt.Sprintf("Pod restarted!\ncluster: %s, pod: %s, namespace: %s", c.clusterName, pod.Name, pod.Namespace),
+			Footer: fmt.Sprintf("%s, %s, %s", c.clusterName, pod.Name, pod.Namespace),
 			Text:   podStatus + podEvents + nodeEvents + containerLogs,
 		}
 		// klog.Infoln(msg.Title + "\n" + msg.Text + "\n" + msg.Footer)
-		slackChannel := getSlackChannelFromPod(pod)
-		err = c.slack.sendToChannel(msg, slackChannel)
+		notifierChannel := getChannelFromPod(pod)
+		err = c.notifier.sendToChannel(msg, notifierChannel)
 		if err != nil {
 			return err
 		}
 
-		c.slack.History[podKey] = currentTime
-		c.cleanOldSlackHistory()
+		c.history[podKey] = currentTime
+		c.cleanOldHistory()
 		break
 	}
 	return nil
@@ -352,23 +364,22 @@ func (c *Controller) getContainerLogs(pod *v1.Pod, containerStatus v1.ContainerS
 	return out, err
 }
 
-// cleanOldSlackHistory deletes old pod name from the c.slack.History.
-func (c *Controller) cleanOldSlackHistory() {
-	currentTime := time.Now().Local()
-	for pod, lastSentTime := range c.slack.History {
-		if currentTime.Sub(lastSentTime).Hours() > 1 {
-			delete(c.slack.History, pod)
-		}
+// getChannelFromPod gets custom notifier channel from pod annotations or labels.
+func getChannelFromPod(pod *v1.Pod) string {
+	if channel, ok := pod.GetAnnotations()[ChannelKey]; ok {
+		return channel
 	}
-}
-
-// getSlackChannelFromPod gets custom slack channel from pod annotations or labels.
-func getSlackChannelFromPod(pod *v1.Pod) string {
-	if slackChannel, ok := pod.GetAnnotations()[SlackChannelKey]; ok {
-		return slackChannel
-	}
-	if slackChannel, ok := pod.GetLabels()[SlackChannelKey]; ok {
-		return slackChannel
+	if channel, ok := pod.GetLabels()[ChannelKey]; ok {
+		return channel
 	}
 	return ""
+}
+
+func (c *Controller) cleanOldHistory() {
+	currentTime := time.Now().Local()
+	for pod, lastSentTime := range c.history {
+		if currentTime.Sub(lastSentTime).Hours() > 1 {
+			delete(c.history, pod)
+		}
+	}
 }
